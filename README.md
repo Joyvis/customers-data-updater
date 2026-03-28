@@ -13,6 +13,76 @@ Multi-tenant SaaS platform for automated real estate data refresh via AI-powered
 - **AI:** Claude API (conversation orchestration)
 - **Messaging:** WhatsApp Business API
 
+## Data Flow
+
+```mermaid
+flowchart TB
+    subgraph Upload["1 - Upload"]
+        A[/"CSV / Excel file"/] -->|POST /batches/upload| B[Validate headers & size]
+        B -->|phone_number + owner_name required| C[Store file in S3]
+        C --> D[Create Batch<br/>status: UPLOADED]
+        D -->|Celery task queued| E[[process_batch_task]]
+    end
+
+    subgraph Processing["2 - Async Processing (Celery Worker)"]
+        E --> F[Download from S3]
+        F --> G[Parse file<br/>detect encoding<br/>UTF-8 / Latin-1]
+        G --> H[Create BatchRecords<br/>in chunks of 100]
+        H --> I[Entity type validation<br/>check required columns<br/>per EntityTypeConfig]
+        I --> J[Deduplication<br/>group by phone + entity_type]
+        J --> K[Column auto-mapping<br/>from ColumnMapping dictionary]
+        K --> L[Batch status: REVIEW]
+    end
+
+    subgraph Review["3 - Human Review"]
+        L --> M{Issues to resolve?}
+        M -->|Validation errors| M1[Review errors<br/>GET /batches/id/errors]
+        M -->|Dedup groups| M2[Merge or skip duplicates<br/>POST .../dedup-groups/id/resolve]
+        M -->|Unmapped columns| M3[Assign friendly names<br/>PUT /mappings]
+        M -->|Recently refreshed| M4[Skip or re-refresh<br/>GET .../recently-refreshed]
+        M1 & M2 & M3 & M4 --> N[POST /batches/id/approve]
+    end
+
+    subgraph Approval["4 - Approval"]
+        N --> O{Phone opted out?}
+        O -->|Yes| P[Record status: OPTED_OUT]
+        O -->|No| Q[Create Conversation<br/>status: READY]
+        Q --> R[[send_initial_outreach_task]]
+    end
+
+    subgraph Outreach["5 - AI WhatsApp Outreach (Celery Worker)"]
+        R --> S[Send template message<br/>via WhatsApp Business API]
+        S --> T[Conversation status: IN_PROGRESS]
+        T --> U[/Owner replies via WhatsApp/]
+        U -->|Webhook POST /webhooks/whatsapp| V[Claude API processes response]
+        V --> W{Classification}
+        W -->|confirmed| X[Copy original_data to updated_data<br/>Conversation: COMPLETED]
+        W -->|updated| Y[Extract changes to updated_data<br/>Conversation: COMPLETED]
+        W -->|unclear| Z{Message limit<br/>reached?}
+        Z -->|No| AA[Send follow-up message] --> U
+        Z -->|Yes| AB[Dead letter queue<br/>Conversation: FAILED]
+        W -->|opt-out| AC[Add to OptOutList<br/>Conversation: CANCELLED]
+        AB & AC --> AD[Record status: DEAD_LETTER]
+    end
+
+    subgraph Completion["6 - Export"]
+        X & Y --> AE[Record status: COMPLETED]
+        AE & AD & P --> AF{All conversations<br/>finished?}
+        AF -->|All success| AG[Batch: COMPLETED]
+        AF -->|Some dead letters| AH[Batch: PARTIALLY_COMPLETED]
+        AG & AH --> AI[GET /batches/id/download]
+        AI --> AJ[Generate CSV/Excel<br/>friendly column names<br/>updated values<br/>status column]
+        AJ --> AK[/"Refreshed CSV / Excel file"/]
+    end
+
+    style Upload fill:#e8f4fd,stroke:#1a73e8
+    style Processing fill:#fef7e0,stroke:#f9a825
+    style Review fill:#fce4ec,stroke:#e53935
+    style Approval fill:#e8f5e9,stroke:#43a047
+    style Outreach fill:#f3e5f5,stroke:#8e24aa
+    style Completion fill:#e0f2f1,stroke:#00897b
+```
+
 ## Data Model
 
 ```mermaid
